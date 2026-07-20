@@ -1,0 +1,81 @@
+name: LWJGL Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  S3_PARAMS: --cache-control "public,must-revalidate,proxy-revalidate,max-age=0"
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+      - name: Install dependencies
+        run: |
+          brew install cmake meson libclc llvm spirv-headers spirv-llvm-translator spirv-tools
+
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+          python3 -m venv $HOME/venv_mesa
+          source $HOME/venv_mesa/bin/activate
+          pip3 install mako packaging pyyaml
+      - name: Build static SPIRV-Tools
+        run: |
+          SPIRV_TOOLS_VERSION="$(brew info --json=v2 spirv-tools | python3 -c 'import json, sys; print(json.load(sys.stdin)["formulae"][0]["versions"]["stable"])')"
+          SPIRV_TOOLS_SOURCE="$RUNNER_TEMP/spirv-tools-source"
+          SPIRV_TOOLS_BUILD="$RUNNER_TEMP/spirv-tools-build"
+          SPIRV_TOOLS_PREFIX="$RUNNER_TEMP/spirv-tools-static"
+
+          git clone --depth 1 --branch "vulkan-sdk-$SPIRV_TOOLS_VERSION" https://github.com/KhronosGroup/SPIRV-Tools.git "$SPIRV_TOOLS_SOURCE"
+          cmake -S "$SPIRV_TOOLS_SOURCE" -B "$SPIRV_TOOLS_BUILD" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$SPIRV_TOOLS_PREFIX" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DSPIRV-Headers_SOURCE_DIR="$(brew --prefix spirv-headers)" \
+            -DSPIRV_SKIP_EXECUTABLES=ON \
+            -DSPIRV_SKIP_TESTS=ON \
+            -DSPIRV_TOOLS_BUILD_STATIC=ON
+
+          cmake --build "$SPIRV_TOOLS_BUILD" --target SPIRV-Tools-link spirv-tools-pkg-config
+
+          cmake -E make_directory \
+            "$SPIRV_TOOLS_PREFIX/include/spirv-tools" \
+            "$SPIRV_TOOLS_PREFIX/lib/pkgconfig"
+          cmake -E copy_directory \
+            "$SPIRV_TOOLS_SOURCE/include/spirv-tools" \
+            "$SPIRV_TOOLS_PREFIX/include/spirv-tools"
+          cmake -E copy \
+            "$SPIRV_TOOLS_BUILD/source/libSPIRV-Tools.a" \
+            "$SPIRV_TOOLS_BUILD/source/opt/libSPIRV-Tools-opt.a" \
+            "$SPIRV_TOOLS_BUILD/source/link/libSPIRV-Tools-link.a" \
+            "$SPIRV_TOOLS_PREFIX/lib"
+          cmake -E copy \
+            "$SPIRV_TOOLS_BUILD/SPIRV-Tools.pc" \
+            "$SPIRV_TOOLS_PREFIX/lib/pkgconfig/SPIRV-Tools.pc"
+
+          echo "PKG_CONFIG_PATH=$SPIRV_TOOLS_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Configure build
+        run: |
+          source $HOME/venv_mesa/bin/activate
+          meson setup build --buildtype=release -Dplatforms=macos -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false -Dzstd=disabled --prefer-static
+      - name: Build
+        run: |
+          source $HOME/venv_mesa/bin/activate
+          meson compile --verbose -C build
+          strip -u -r build/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib
+      - name: Upload artifact
+        run: aws s3 cp build/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib s3://lwjgl-build/nightly/macosx/arm64/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git log --first-parent --pretty=format:%H HEAD~2..HEAD~1 > libvulkan_kosmickrisp.dylib.git
+          aws s3 cp libvulkan_kosmickrisp.dylib.git s3://lwjgl-build/nightly/macosx/arm64/ ${{env.S3_PARAMS}}
